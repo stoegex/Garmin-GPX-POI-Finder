@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated exports
+*_pois.fit
+*_pois.gpx
+*_etappe*.fit
+*_etappe*.gpx
