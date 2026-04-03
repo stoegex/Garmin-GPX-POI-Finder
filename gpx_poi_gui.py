@@ -19,6 +19,7 @@ from pathlib import Path
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import tkinter as tk
+import tkintermapview
 
 # ─────────────────────────────────────────────
 # Strava-Farbpalette
@@ -104,6 +105,30 @@ TYPE_INFO = {
     "unknown":               ("POI",                   "Waypoint",         "GENERIC"),
 }
 
+# Emoji + Farbe je POI-Typ für Kartenmarker
+POI_MARKER_STYLE = {
+    "drinking_water":         ("💧", "#3498DB"),
+    "fountain":               ("⛲", "#3498DB"),
+    "spring":                 ("🌿", "#3498DB"),
+    "water_tap":              ("🚰", "#3498DB"),
+    "water_point":            ("💦", "#3498DB"),
+    "kneipp_water_cure":      ("🦵", "#3498DB"),
+    "public_bath":            ("🏊", "#3498DB"),
+    "restaurant":             ("🍽", "#E67E22"),
+    "cafe":                   ("☕", "#E67E22"),
+    "food_court":             ("🥙", "#E67E22"),
+    "fast_food":              ("🍔", "#E67E22"),
+    "supermarket":            ("🛒", "#E67E22"),
+    "convenience":            ("🏪", "#E67E22"),
+    "health_food":            ("🌿", "#E67E22"),
+    "bakery":                 ("🥐", "#E67E22"),
+    "organic":                ("🌱", "#E67E22"),
+    "toilets":                ("🚻", "#9B59B6"),
+    "shelter":                ("🏕", "#2ECC71"),
+    "bicycle":                ("🚲", "#E74C3C"),
+    "bicycle_repair_station": ("🔧", "#E74C3C"),
+}
+
 
 # ─────────────────────────────────────────────
 # Hilfsfunktionen
@@ -126,26 +151,68 @@ def compute_cumulative_distances(track_points):
     return dists
 
 
+def _parse_gpx_etree(gpx_path):
+    try:
+        tree = ET.parse(gpx_path)
+    except ET.ParseError as e:
+        raise ValueError(f"Ungültige GPX/XML-Datei: {e}") from e
+
+    root = tree.getroot()
+
+    def _read_points(tag):
+        pts = []
+        for el in root.findall(f".//{{*}}{tag}"):
+            lat = el.attrib.get("lat")
+            lon = el.attrib.get("lon")
+            if lat is None or lon is None:
+                continue
+            ele_el = el.find(".//{*}ele")
+            ele = float(ele_el.text) if (ele_el is not None and ele_el.text) else 0.0
+            pts.append({"lat": float(lat), "lon": float(lon), "ele": ele})
+        return pts
+
+    points = _read_points("trkpt") + _read_points("rtept")
+
+    name = ""
+    trk_name = root.find(".//{*}trk/{*}name")
+    meta_name = root.find(".//{*}metadata/{*}name")
+    gpx_name = root.find(".//{*}name")
+    if trk_name is not None and trk_name.text:
+        name = trk_name.text
+    elif meta_name is not None and meta_name.text:
+        name = meta_name.text
+    elif gpx_name is not None and gpx_name.text:
+        name = gpx_name.text
+
+    return points, name
+
+
 def parse_gpx(gpx_path):
-    import gpxpy
-    with open(gpx_path, "r", encoding="utf-8") as f:
-        gpx = gpxpy.parse(f)
-    points = []
-    for track in gpx.tracks:
-        for seg in track.segments:
-            for pt in seg.points:
+    try:
+        import gpxpy
+        with open(gpx_path, "r", encoding="utf-8") as f:
+            gpx = gpxpy.parse(f)
+        points = []
+        for track in gpx.tracks:
+            for seg in track.segments:
+                for pt in seg.points:
+                    points.append({"lat": pt.latitude, "lon": pt.longitude,
+                                   "ele": pt.elevation or 0.0})
+        for route in gpx.routes:
+            for pt in route.points:
                 points.append({"lat": pt.latitude, "lon": pt.longitude,
                                "ele": pt.elevation or 0.0})
-    for route in gpx.routes:
-        for pt in route.points:
-            points.append({"lat": pt.latitude, "lon": pt.longitude,
-                           "ele": pt.elevation or 0.0})
-    name = ""
-    if gpx.tracks and gpx.tracks[0].name:
-        name = gpx.tracks[0].name
-    elif gpx.name:
-        name = gpx.name
-    return points, name
+        name = ""
+        if gpx.tracks and gpx.tracks[0].name:
+            name = gpx.tracks[0].name
+        elif gpx.name:
+            name = gpx.name
+        return points, name
+    except ModuleNotFoundError:
+        return _parse_gpx_etree(gpx_path)
+    except Exception:
+        # Fallback auf ET, wenn gpxpy mit dem GPX nicht klarkommt
+        return _parse_gpx_etree(gpx_path)
 
 
 def compute_elevation_gain(track_points):
@@ -249,18 +316,39 @@ def _esc(t):
 # ─────────────────────────────────────────────
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 CHUNK_SIZE   = 40
+# "bbox" reduziert die Query-Größe drastisch (schneller), lokal wird danach
+# noch per Radius gefiltert. "around" ist genauer am Server, aber sehr langsam.
+OVERPASS_MODE = "bbox"  # "bbox" oder "around"
 
 
 def _build_query(chunk_points, radius_m, queries):
-    """Baut eine Overpass-Query mit `around`-Filter pro Stützpunkt.
-    Statt einer groben Bounding-Box wird pro Punkt ein exakter Kreis-Radius
-    abgefragt → dramatisch weniger False-Positives, kleinere Antworten.
+    """Baut eine Overpass-Query.
+    - mode "around": exakter Kreis pro Punkt (sehr viele Abfragen, langsam)
+    - mode "bbox": eine Bounding-Box pro Chunk (schneller), Radius wird lokal geprüft
     """
-    # around:radius,lat,lon – für jeden Stützpunkt einen Kreis aufspannen
-    parts = []
-    for q in queries:
-        for lat, lon in chunk_points:
-            parts.append(f"  {q}(around:{radius_m},{lat:.6f},{lon:.6f});")
+    if OVERPASS_MODE == "around":
+        parts = []
+        for q in queries:
+            for lat, lon in chunk_points:
+                parts.append(f"  {q}(around:{radius_m},{lat:.6f},{lon:.6f});")
+        union = "\n".join(parts)
+        return f"[out:json][timeout:90];\n(\n{union}\n);\nout body;"
+
+    # bbox mode
+    lats = [p[0] for p in chunk_points]
+    lons = [p[1] for p in chunk_points]
+    lat_min, lat_max = min(lats), max(lats)
+    lon_min, lon_max = min(lons), max(lons)
+    lat_mean = (lat_min + lat_max) / 2.0
+    # grobe Umrechnung Meter -> Grad
+    dlat = radius_m / 111_320.0
+    dlon = radius_m / (111_320.0 * max(0.2, math.cos(math.radians(lat_mean))))
+    south = lat_min - dlat
+    north = lat_max + dlat
+    west  = lon_min - dlon
+    east  = lon_max + dlon
+
+    parts = [f"  {q}({south:.6f},{west:.6f},{north:.6f},{east:.6f});" for q in queries]
     union = "\n".join(parts)
     return f"[out:json][timeout:90];\n(\n{union}\n);\nout body;"
 
@@ -365,9 +453,12 @@ def nodes_to_waypoints(nodes, track_points, warn_dist_m=100):
     return wpts
 
 
-def write_gpx_with_waypoints(original_gpx_path, waypoints, out_path):
+def write_gpx_with_waypoints(original_gpx_path, waypoints, out_path, overwrite_existing=False):
     with open(original_gpx_path, "r", encoding="utf-8") as f:
         content = f.read()
+    if overwrite_existing:
+        # Entfernt vorhandene <wpt>...</wpt> Blöcke (ohne Namespaces) aus dem Original
+        content = re.sub(r"\s*<wpt\b[\s\S]*?</wpt>\s*", "\n", content, flags=re.IGNORECASE)
     wpt_lines = []
     for wp in waypoints:
         cmt_line = f'\n    <cmt>{_esc(wp.get("cmt",""))}</cmt>' if wp.get("cmt") else ""
@@ -526,6 +617,72 @@ def write_fit_course(route_name, track_points, cum_dists, waypoints, out_path):
 # Tour-Splitter
 # ─────────────────────────────────────────────
 
+def _bisect_cum_dists(cum_dists, target_m):
+    """Binäre Suche: findet den Track-Index, dessen kumulative Distanz target_m am nächsten ist."""
+    lo, hi = 0, len(cum_dists) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cum_dists[mid] < target_m:
+            lo = mid + 1
+        else:
+            hi = mid
+    # lo ist der erste Index >= target_m; prüfe ob lo-1 näher ist
+    if lo > 0 and abs(cum_dists[lo - 1] - target_m) < abs(cum_dists[lo] - target_m):
+        return lo - 1
+    return lo
+
+
+def _find_nearest_track_idx(track_points, lat, lon):
+    """Findet den nächsten Track-Punkt-Index zu einer gegebenen Koordinate."""
+    best_d, best_i = float("inf"), 0
+    for j, tp in enumerate(track_points):
+        d = haversine(lat, lon, tp["lat"], tp["lon"])
+        if d < best_d:
+            best_d, best_i = d, j
+    return best_i, best_d
+
+
+def _precompute_water_at_track(track_points, water_pts, max_dist=1000):
+    """Vorberechnung: für jeden Track-Punkt die Distanz zur nächsten Wasserquelle.
+
+    Gibt ein Array zurück mit der Distanz in Metern (capped bei max_dist).
+    So muss find_best_split nur noch per Index nachschlagen statt O(W) pro Kandidat.
+    """
+    n = len(track_points)
+    water_dist = [max_dist] * n
+
+    if not water_pts:
+        return water_dist
+
+    # Track-Punkte ausdünnen: nur jeden k-ten prüfen (nah beieinander = ähnliche Distanz)
+    # und dann interpolieren für die dazwischen
+    step = max(1, n // 500)  # ~500 Stichproben reichen für km-Genauigkeit
+    sampled = list(range(0, n, step))
+    if sampled[-1] != n - 1:
+        sampled.append(n - 1)
+
+    # Für die gesampelten Punkte: volle Berechnung
+    sampled_dists = []
+    for si in sampled:
+        tp = track_points[si]
+        closest = min(
+            haversine(tp["lat"], tp["lon"], wlat, wlon)
+            for wlat, wlon in water_pts
+        )
+        sampled_dists.append(min(closest, max_dist))
+
+    # Interpolation zwischen gesampelten Werten
+    for k in range(len(sampled) - 1):
+        i0, i1 = sampled[k], sampled[k + 1]
+        d0, d1 = sampled_dists[k], sampled_dists[k + 1]
+        span = i1 - i0
+        for j in range(i0, i1 + 1):
+            t = (j - i0) / span if span > 0 else 0
+            water_dist[j] = d0 + t * (d1 - d0)
+
+    return water_dist
+
+
 def split_tour_auto(track_points, cum_dists, n_days, log_fn=None, poi_wpts=None):
     """Intelligenter Etappen-Splitter.
 
@@ -549,53 +706,51 @@ def split_tour_auto(track_points, cum_dists, n_days, log_fn=None, poi_wpts=None)
             and not w["type"].endswith("_warn")
         ]
 
+    # Vorberechnung: Wasser-Distanz pro Track-Punkt (O(n*W) einmalig statt pro Kandidat)
+    water_dist = _precompute_water_at_track(track_points, water_pts)
+
     def find_best_split(start_idx, target_km, is_first_day=False):
         target_m = target_km * 1000
         start_d  = cum_dists[start_idx]
 
         # Fenster-Grenzen
-        # Tag 1: etwas kürzer starten (Anreise, Eingewöhnung)
         lo = target_m * (0.65 if is_first_day else 0.78)
         hi = target_m * (0.92 if is_first_day else 1.22)
 
+        # Binäre Suche für Fenster-Start und -Ende statt linearer Scan
+        search_end_m = start_d + hi * 1.5
+        window_end = _bisect_cum_dists(cum_dists, search_end_m)
+        window_end = min(window_end, len(track_points) - 1)
+
         # Lokales Höhenminimum im Suchfenster berechnen
-        window_start = start_idx
-        window_end   = len(track_points) - 1
-        # Suchfenster: lo..hi*1.5 der Zieldistanz
-        for j in range(start_idx, len(track_points)):
-            if cum_dists[j] - start_d > hi * 1.5:
-                window_end = j
-                break
-        window_pts    = track_points[window_start:window_end + 1]
+        window_pts    = track_points[start_idx:window_end + 1]
         local_ele_min = min(p["ele"] for p in window_pts) if window_pts else 0
         local_ele_max = max(p["ele"] for p in window_pts) if window_pts else 1
         local_range   = max(local_ele_max - local_ele_min, 1.0)
 
+        # Binäre Suche für Startpunkt des Scoring-Fensters (ab lo * 0.5)
+        scan_start = _bisect_cum_dists(cum_dists, start_d + lo * 0.5)
+        scan_start = max(scan_start, start_idx + 1)
+
         best_idx, best_score = -1, float("inf")
 
-        for i in range(start_idx + 1, len(track_points)):
+        for i in range(scan_start, window_end + 1):
             seg = cum_dists[i] - start_d
-            if seg > hi * 1.5:
-                break
 
             # 1. Distanz-Score [0..∞]: Abweichung vom Ziel
             if lo <= seg <= hi:
-                dist_score = abs(seg - target_m) / target_m          # 0 = perfekt
+                dist_score = abs(seg - target_m) / target_m
             else:
-                dist_score = 0.5 + abs(seg - target_m) / target_m    # Strafe außerhalb
+                dist_score = 0.5 + abs(seg - target_m) / target_m
 
             # 2. Lokales Höhen-Score [0..1]: 0 = lokales Tal, 1 = lokale Kuppe
             ele_norm = (track_points[i]["ele"] - local_ele_min) / local_range
 
-            # 3. POI-Bonus [-0.35..0]: nahe an Wasser/Unterstand → negativer Score-Beitrag
+            # 3. POI-Bonus [-0.35..0]: vorberechnete Wasser-Distanz nachschlagen
             water_bonus = 0.0
-            if water_pts:
-                closest = min(
-                    haversine(track_points[i]["lat"], track_points[i]["lon"], wlat, wlon)
-                    for wlat, wlon in water_pts
-                )
-                if closest < 1000:  # innerhalb 1 km
-                    water_bonus = 0.35 * (1.0 - closest / 1000.0)  # max. 0.35 Bonus
+            wd = water_dist[i]
+            if wd < 1000:
+                water_bonus = 0.35 * (1.0 - wd / 1000.0)
 
             score = dist_score + ele_norm * 0.4 - water_bonus
             if score < best_score:
@@ -612,12 +767,9 @@ def split_tour_auto(track_points, cum_dists, n_days, log_fn=None, poi_wpts=None)
         nxt    = find_best_split(cur, target, is_first_day=(day == 1))
         splits.append(nxt)
         seg_km = (cum_dists[nxt] - cum_dists[cur]) / 1000.0
-        # Nächste Wasserquelle vom Splitpunkt
+        # Nächste Wasserquelle vom Splitpunkt (vorberechnet)
         if water_pts and log_fn:
-            closest_w = min(
-                haversine(track_points[nxt]["lat"], track_points[nxt]["lon"], wlat, wlon)
-                for wlat, wlon in water_pts
-            )
+            closest_w = water_dist[nxt]
             water_info = f" | 💧 Wasser {closest_w:.0f}m" if closest_w < 1000 else ""
         else:
             water_info = ""
@@ -632,7 +784,7 @@ def split_tour_auto(track_points, cum_dists, n_days, log_fn=None, poi_wpts=None)
     return splits
 
 
-def split_tour_manual(track_points, cum_dists, split_km_list):
+def split_tour_manual(track_points, cum_dists, split_km_list):  # noqa: ARG001
     total_km = cum_dists[-1] / 1000.0
 
     # Sortieren, Werte außerhalb der Strecke verwerfen, Duplikate entfernen
@@ -641,12 +793,7 @@ def split_tour_manual(track_points, cum_dists, split_km_list):
     splits = []
     for km in km_list:
         target_m = km * 1000
-        best_i, best_d = 0, float("inf")
-        for i, d in enumerate(cum_dists):
-            diff = abs(d - target_m)
-            if diff < best_d:
-                best_d, best_i = diff, i
-        # Duplikat-Indizes und rückwärts laufende Indizes überspringen
+        best_i = _bisect_cum_dists(cum_dists, target_m)
         if splits and best_i <= splits[-1]:
             continue
         splits.append(best_i)
@@ -715,6 +862,7 @@ TAB_NAMES = [
     "📂  Route",
     "⚙️  Einstellungen",
     "🔍  Suchen",
+    "🗺  Karte & Filter",
     "✂  Tour aufteilen",
     "✅  Abschließen",
 ]
@@ -722,8 +870,9 @@ STEP_LABELS = [
     ("1", "Route laden"),
     ("2", "Einstellungen"),
     ("3", "POIs suchen"),
-    ("4", "Tour aufteilen"),
-    ("5", "Abschließen"),
+    ("4", "Karte & Filter"),
+    ("5", "Tour aufteilen"),
+    ("6", "Abschließen"),
 ]
 
 
@@ -740,6 +889,7 @@ class GPXPOIApp(ctk.CTk):
         self.track_points = []
         self.cum_dists    = []
         self.route_name   = ""
+        self.course_name_var = tk.StringVar()
         self.found_wpts   = []
         self.log_queue    = queue.Queue()
         self._cancel_ev   = threading.Event()
@@ -822,11 +972,12 @@ class GPXPOIApp(ctk.CTk):
         for name in TAB_NAMES:
             self.tabview.add(name)
 
-        self._build_tab_route    (self.tabview.tab(TAB_NAMES[0]))
-        self._build_tab_settings (self.tabview.tab(TAB_NAMES[1]))
-        self._build_tab_search   (self.tabview.tab(TAB_NAMES[2]))
-        self._build_tab_split    (self.tabview.tab(TAB_NAMES[3]))
-        self._build_tab_finish   (self.tabview.tab(TAB_NAMES[4]))
+        self._build_tab_route      (self.tabview.tab(TAB_NAMES[0]))
+        self._build_tab_settings   (self.tabview.tab(TAB_NAMES[1]))
+        self._build_tab_search     (self.tabview.tab(TAB_NAMES[2]))
+        self._build_tab_map_filter (self.tabview.tab(TAB_NAMES[3]))
+        self._build_tab_split      (self.tabview.tab(TAB_NAMES[4]))
+        self._build_tab_finish     (self.tabview.tab(TAB_NAMES[5]))
 
     def _set_step(self, active):
         for i, (badge, lbl) in enumerate(zip(self._step_badges, self._step_lbls)):
@@ -1053,14 +1204,84 @@ class GPXPOIApp(ctk.CTk):
             ctk.CTkLabel(wt, text=t, font=("Helvetica", 9),
                          text_color=STRAVA_MUTED).pack(side="left", expand=True)
 
+        # ── Stützpunkt-Abstand (Sampling) ───
+        samp_card = StravaCard(scroll)
+        samp_card.pack(fill="x", pady=(0, 14))
+        sh = ctk.CTkFrame(samp_card, fg_color="transparent")
+        sh.pack(fill="x", padx=16, pady=(12, 2))
+        ctk.CTkLabel(sh, text="Stützpunkt-Abstand",
+                     font=("Helvetica", 13, "bold"),
+                     text_color=STRAVA_TEXT).pack(side="left")
+        self.sample_label = ctk.CTkLabel(sh, text="Auto (200 m)",
+                                          font=("Helvetica", 13, "bold"),
+                                          text_color=STRAVA_BLUE)
+        self.sample_label.pack(side="right")
+        ctk.CTkLabel(samp_card,
+                     text="Kleiner = genauer & langsamer, größer = schneller",
+                     font=("Helvetica", 11), text_color=STRAVA_MUTED
+                     ).pack(anchor="w", padx=16)
+
+        self.sample_mode = tk.StringVar(value="auto")
+        self.sample_var = tk.IntVar(value=adaptive_sample_step(self.radius_var.get()))
+
+        mode_row = ctk.CTkFrame(samp_card, fg_color="transparent")
+        mode_row.pack(fill="x", padx=16, pady=(6, 4))
+        ctk.CTkRadioButton(mode_row, text="Auto",
+                           variable=self.sample_mode, value="auto",
+                           fg_color=STRAVA_BLUE, hover_color=STRAVA_HOVER,
+                           text_color=STRAVA_TEXT,
+                           font=("Helvetica", 11),
+                           command=self._toggle_sample_mode
+                           ).pack(side="left", padx=(0, 12))
+        ctk.CTkRadioButton(mode_row, text="Manuell",
+                           variable=self.sample_mode, value="manual",
+                           fg_color=STRAVA_BLUE, hover_color=STRAVA_HOVER,
+                           text_color=STRAVA_TEXT,
+                           font=("Helvetica", 11),
+                           command=self._toggle_sample_mode
+                           ).pack(side="left")
+
+        self.sample_slider = ctk.CTkSlider(
+            samp_card, from_=100, to=1200, number_of_steps=22,
+            variable=self.sample_var,
+            fg_color=STRAVA_CARD2, progress_color=STRAVA_BLUE,
+            button_color=STRAVA_BLUE, button_hover_color=STRAVA_HOVER,
+            command=self._on_sample_slide,
+        )
+        self.sample_slider.pack(fill="x", padx=16, pady=(4, 4))
+        st = ctk.CTkFrame(samp_card, fg_color="transparent")
+        st.pack(fill="x", padx=16, pady=(0, 12))
+        for t in ["100 m", "300 m", "500 m", "800 m", "1.2 km"]:
+            ctk.CTkLabel(st, text=t, font=("Helvetica", 9),
+                         text_color=STRAVA_MUTED).pack(side="left", expand=True)
+        # initial state
+        self._toggle_sample_mode()
+
         # ── Ausgabe-Optionen ─────────────────
         out_card = StravaCard(scroll)
         out_card.pack(fill="x", pady=(0, 14))
         ctk.CTkLabel(out_card, text="Ausgabe-Formate",
                      font=("Helvetica", 13, "bold"),
                      text_color=STRAVA_TEXT).pack(anchor="w", padx=16, pady=(12, 8))
+
+        # Course Name für FIT-Export
+        cn_row = ctk.CTkFrame(out_card, fg_color="transparent")
+        cn_row.pack(fill="x", padx=16, pady=(0, 8))
+        ctk.CTkLabel(cn_row, text="Course Name (FIT):",
+                     font=("Helvetica", 12), text_color=STRAVA_TEXT).pack(side="left")
+        ctk.CTkLabel(cn_row, text="max 16 Zeichen",
+                     font=("Helvetica", 9), text_color=STRAVA_MUTED).pack(side="right")
+        self.course_name_entry = ctk.CTkEntry(
+            out_card, textvariable=self.course_name_var,
+            placeholder_text="wird aus GPX-Route übernommen",
+            fg_color=STRAVA_CARD2, border_color=STRAVA_BORDER,
+            text_color=STRAVA_TEXT, placeholder_text_color=STRAVA_MUTED,
+            font=("Helvetica", 13), height=36)
+        self.course_name_entry.pack(fill="x", padx=16, pady=(0, 10))
+
         self.var_fit = tk.BooleanVar(value=True)
         self.var_gpx = tk.BooleanVar(value=True)
+        self.var_overwrite_wpt = tk.BooleanVar(value=True)
         orow = ctk.CTkFrame(out_card, fg_color="transparent")
         orow.pack(fill="x", padx=16, pady=(0, 12))
         for var, lbl in [(self.var_fit, "FIT-Datei (Garmin Edge)"),
@@ -1069,6 +1290,12 @@ class GPXPOIApp(ctk.CTk):
                              fg_color=STRAVA_ORANGE, hover_color=STRAVA_HOVER,
                              text_color=STRAVA_TEXT,
                              font=("Helvetica", 12)).pack(side="left", padx=12)
+        ctk.CTkCheckBox(out_card, text="Vorhandene POIs überschreiben",
+                         variable=self.var_overwrite_wpt,
+                         fg_color=STRAVA_ORANGE, hover_color=STRAVA_HOVER,
+                         text_color=STRAVA_TEXT,
+                         font=("Helvetica", 11)
+                         ).pack(anchor="w", padx=16, pady=(0, 12))
 
         # Weiter
         StravaButton(scroll, text="Weiter  →  POIs suchen",
@@ -1141,13 +1368,148 @@ class GPXPOIApp(ctk.CTk):
         self.result_lbl.pack(anchor="w", padx=16, pady=(0, 12))
 
         # Weiter
-        StravaButton(scroll, text="Weiter  →  Tour aufteilen",
+        StravaButton(scroll, text="Weiter  →  Karte & Filter",
                      font=("Helvetica", 13, "bold"), height=44,
                      fg_color=STRAVA_CARD2, hover_color=STRAVA_CARD,
                      border_width=1, border_color=STRAVA_BORDER,
                      command=lambda: self._set_step(3)).pack(fill="x")
 
-    # ── Tab 4: Tour aufteilen ────────────────
+    # ── Tab 4: Karte & POI-Filter ──────────
+
+    def _build_tab_map_filter(self, tab):
+        tab.configure(fg_color=STRAVA_DARKER)
+
+        # Hauptlayout: Links Karte, rechts Filter-Panel
+        main = ctk.CTkFrame(tab, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+        main.grid_columnconfigure(0, weight=3)
+        main.grid_columnconfigure(1, weight=1)
+        main.grid_rowconfigure(0, weight=1)
+
+        # ── Linke Seite: Karte ──
+        map_frame = ctk.CTkFrame(main, fg_color=STRAVA_CARD, corner_radius=10)
+        map_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        map_frame.grid_rowconfigure(1, weight=1)
+        map_frame.grid_columnconfigure(0, weight=1)
+
+        # Karten-Header
+        mh = ctk.CTkFrame(map_frame, fg_color="transparent")
+        mh.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        ctk.CTkLabel(mh, text="🗺  Route & POIs",
+                     font=("Helvetica", 15, "bold"),
+                     text_color=STRAVA_TEXT).pack(side="left")
+        self._map_status = ctk.CTkLabel(mh, text="Keine POIs geladen",
+                                         font=("Helvetica", 10),
+                                         text_color=STRAVA_MUTED)
+        self._map_status.pack(side="right")
+
+        # Karte
+        self._map_widget = tkintermapview.TkinterMapView(
+            map_frame, corner_radius=8)
+        self._map_widget.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self._map_widget.set_tile_server(
+            "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+        self._map_widget.set_position(47.5, 13.0)  # Österreich default
+        self._map_widget.set_zoom(6)
+
+        # Interne State-Listen für Marker
+        self._map_markers = []       # Liste von (marker_obj, wpt_index)
+        self._map_path = None        # Polyline-Objekt
+        self._poi_enabled = []       # bool pro POI (parallel zu found_wpts)
+        self._map_right_click_tol_m = 80  # Klick-Toleranz zum nächsten POI
+        self._map_hover_tol_m = 60
+        self._delete_popup = None
+        self._delete_popup_idx = None
+        self._hover_poi_idx = None
+
+        # Rechtsklick: POI in der Nähe löschen
+        try:
+            # ohne add="+" damit wir die Default-Right-Click-Coords unterdrücken
+            self._map_widget.canvas.bind("<Button-3>", self._on_map_right_click)
+            self._map_widget.canvas.bind("<Button-1>", self._on_map_left_click, add="+")
+            self._map_widget.canvas.bind("<Motion>", self._on_map_motion, add="+")
+            self._map_widget.canvas.bind("<Leave>", self._on_map_leave, add="+")
+        except Exception:
+            # Fallback: wenn canvas nicht verfügbar ist, still ignorieren
+            pass
+
+        # ── Rechte Seite: Filter-Panel ──
+        filter_frame = ctk.CTkFrame(main, fg_color=STRAVA_CARD, corner_radius=10)
+        filter_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        filter_frame.grid_rowconfigure(2, weight=1)
+        filter_frame.grid_columnconfigure(0, weight=1)
+
+        # Filter-Header
+        fh = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        fh.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        ctk.CTkLabel(fh, text="POI-Filter",
+                     font=("Helvetica", 14, "bold"),
+                     text_color=STRAVA_TEXT).pack(side="left")
+        self._filter_count_lbl = ctk.CTkLabel(
+            fh, text="0 / 0", font=("Helvetica", 11, "bold"),
+            text_color=STRAVA_ORANGE)
+        self._filter_count_lbl.pack(side="right")
+
+        # Schnell-Buttons
+        btn_row = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        btn_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
+        ctk.CTkButton(btn_row, text="Alle", width=60, height=26,
+                       fg_color=STRAVA_GREEN, hover_color="#27AE60",
+                       text_color="#FFF", font=("Helvetica", 10, "bold"),
+                       corner_radius=4,
+                       command=lambda: self._set_all_pois_enabled(True)
+                       ).pack(side="left", padx=2)
+        ctk.CTkButton(btn_row, text="Keine", width=60, height=26,
+                       fg_color="#E74C3C", hover_color="#C0392B",
+                       text_color="#FFF", font=("Helvetica", 10, "bold"),
+                       corner_radius=4,
+                       command=lambda: self._set_all_pois_enabled(False)
+                       ).pack(side="left", padx=2)
+
+        # Kategorie-Filter Buttons
+        self._cat_filter_btns = {}
+        cat_row = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        cat_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(28, 4))
+        for grp_label, grp_keys in POI_GROUPS:
+            emoji = grp_label.split()[0]
+            btn = ctk.CTkButton(
+                cat_row, text=emoji, width=32, height=26,
+                fg_color=STRAVA_CARD2, hover_color=STRAVA_BORDER,
+                text_color=STRAVA_TEXT, font=("Helvetica", 12),
+                corner_radius=4,
+                command=lambda keys=grp_keys: self._toggle_category(keys))
+            btn.pack(side="left", padx=1)
+            for k in grp_keys:
+                self._cat_filter_btns[k] = btn
+
+        # Scrollbare POI-Liste
+        self._poi_list_frame = ctk.CTkScrollableFrame(
+            filter_frame, fg_color=STRAVA_CARD,
+            scrollbar_button_color=STRAVA_BORDER,
+            scrollbar_button_hover_color=STRAVA_MUTED)
+        self._poi_list_frame.grid(row=2, column=0, sticky="nsew", padx=6, pady=(4, 6))
+        self._poi_list_frame.grid_columnconfigure(0, weight=1)
+        self._poi_cb_vars = []    # tk.BooleanVar pro POI
+        self._poi_cb_widgets = [] # Checkbox-Widgets
+
+        # Platzhalter-Text
+        self._poi_list_placeholder = ctk.CTkLabel(
+            self._poi_list_frame, text="Zuerst POIs suchen\n(Tab 3)",
+            font=("Helvetica", 12), text_color=STRAVA_MUTED)
+        self._poi_list_placeholder.pack(pady=30)
+
+        # Navigation
+        nav = ctk.CTkFrame(filter_frame, fg_color="transparent")
+        nav.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 8))
+        StravaButton(nav, text="Weiter → Tour aufteilen",
+                     font=("Helvetica", 12, "bold"), height=38,
+                     command=lambda: self._set_step(4)).pack(fill="x", pady=(0, 4))
+        ctk.CTkButton(nav, text="← Zurück zur Suche", width=180, height=26,
+                       fg_color="transparent", hover_color=STRAVA_CARD2,
+                       text_color=STRAVA_ORANGE, font=("Helvetica", 10),
+                       command=lambda: self._set_step(2)).pack(fill="x")
+
+    # ── Tab 5: Tour aufteilen ────────────────
 
     def _build_tab_split(self, tab):
         tab.configure(fg_color=STRAVA_DARKER)
@@ -1298,11 +1660,11 @@ class GPXPOIApp(ctk.CTk):
                      font=("Helvetica", 13, "bold"), height=44,
                      fg_color=STRAVA_CARD2, hover_color=STRAVA_CARD,
                      border_width=1, border_color=STRAVA_BORDER,
-                     command=lambda: self._set_step(4)).pack(fill="x")
+                     command=lambda: self._set_step(5)).pack(fill="x")
 
         self._toggle_split_mode()
 
-    # ── Tab 5: Abschließen ───────────────────
+    # ── Tab 6: Abschließen ───────────────────
 
     def _build_tab_finish(self, tab):
         tab.configure(fg_color=STRAVA_DARKER)
@@ -1353,9 +1715,12 @@ class GPXPOIApp(ctk.CTk):
         self._log(f"📂 Lade: {os.path.basename(path)}")
         try:
             pts, name = parse_gpx(path)
+            if not pts:
+                raise ValueError("Keine Track- oder Routenpunkte in der GPX gefunden.")
             self.track_points = pts
             self.cum_dists    = compute_cumulative_distances(pts)
             self.route_name   = name
+            self.course_name_var.set((name or "")[:16])
             total_km = self.cum_dists[-1] / 1000
             gain     = compute_elevation_gain(pts)
             self.stat_dist.configure(text=f"{total_km:.1f} km")
@@ -1373,6 +1738,10 @@ class GPXPOIApp(ctk.CTk):
         snapped = max(50, min(1000, round(v / 50) * 50))
         self.radius_var.set(snapped)
         self.radius_label.configure(text=f"{snapped} m")
+        if self.sample_mode.get() == "auto":
+            auto_step = adaptive_sample_step(snapped)
+            self.sample_var.set(auto_step)
+            self.sample_label.configure(text=f"Auto ({auto_step} m)")
 
     def _on_warn_slide(self, v):
         snapped = max(0, min(500, round(v / 50) * 50))
@@ -1381,6 +1750,22 @@ class GPXPOIApp(ctk.CTk):
             self.warn_label.configure(text="Aus", text_color=STRAVA_MUTED)
         else:
             self.warn_label.configure(text=f"{snapped} m", text_color=STRAVA_WARN)
+
+    def _on_sample_slide(self, v):
+        snapped = max(100, min(1200, round(v / 50) * 50))
+        self.sample_var.set(snapped)
+        if self.sample_mode.get() == "manual":
+            self.sample_label.configure(text=f"{snapped} m", text_color=STRAVA_BLUE)
+
+    def _toggle_sample_mode(self):
+        if self.sample_mode.get() == "auto":
+            auto_step = adaptive_sample_step(self.radius_var.get())
+            self.sample_var.set(auto_step)
+            self.sample_label.configure(text=f"Auto ({auto_step} m)", text_color=STRAVA_BLUE)
+            self.sample_slider.configure(state="disabled")
+        else:
+            self.sample_label.configure(text=f"{self.sample_var.get()} m", text_color=STRAVA_BLUE)
+            self.sample_slider.configure(state="normal")
 
     def _set_all_cats(self, val):
         for var in self.poi_vars.values():
@@ -1396,6 +1781,10 @@ class GPXPOIApp(ctk.CTk):
                     if self.poi_vars.get(key, tk.BooleanVar(value=False)).get()]
         r = self.radius_var.get()
         w = self.warn_var.get()
+        if self.sample_mode.get() == "auto":
+            s = f"Auto ({self.sample_var.get()} m)"
+        else:
+            s = f"{self.sample_var.get()} m"
         w_str = f"{w} m vor POI" if w > 0 else "deaktiviert"
         cat_str = ", ".join(selected[:5])
         if len(selected) > 5:
@@ -1404,8 +1793,434 @@ class GPXPOIApp(ctk.CTk):
             cat_str = "⚠️  Keine Kategorie ausgewählt!"
         self.summary_lbl.configure(
             text=f"Kategorien ({len(selected)}): {cat_str}\n"
-                 f"Radius: {r} m   ·   Vorwarnung: {w_str}"
+                 f"Radius: {r} m   ·   Vorwarnung: {w_str}\n"
+                 f"Stützpunkt-Abstand: {s}"
         )
+
+    # ── Karte & Filter ───────────────────────
+
+    def _populate_map(self):
+        """Zeichnet Route + POI-Marker auf die Karte und baut die Filter-Liste."""
+        # Alte Marker/Pfad entfernen
+        self._clear_map()
+
+        wpts = self.found_wpts
+        # POIs ohne _warn Suffix
+        poi_wpts = [(i, w) for i, w in enumerate(wpts) if not w["type"].endswith("_warn")]
+
+        # Enable-State initialisieren (alle an)
+        self._poi_enabled = [True] * len(wpts)
+
+        # Route zeichnen
+        if self.track_points:
+            # Track vereinfachen für Performance (max ~2000 Punkte)
+            step = max(1, len(self.track_points) // 2000)
+            path_coords = [(p["lat"], p["lon"])
+                           for p in self.track_points[::step]]
+            if path_coords:
+                self._map_path = self._map_widget.set_path(
+                    path_coords, color=STRAVA_ORANGE, width=3)
+
+        # POI-Marker setzen
+        for idx, wp in poi_wpts:
+            poi_type = wp.get("type", "unknown")
+            emoji, color = POI_MARKER_STYLE.get(poi_type, ("📍", STRAVA_MUTED))
+            type_info = TYPE_INFO.get(poi_type, ("POI", "", ""))
+            label = f"{emoji} {wp['name'][:30]}" if wp.get("name") else f"{emoji} {type_info[0]}"
+            marker = self._map_widget.set_marker(
+                wp["lat"], wp["lon"], text=label,
+                marker_color_circle=color,
+                marker_color_outside=STRAVA_DARK)
+            self._map_markers.append((marker, idx))
+
+        # Karte auf Route zentrieren
+        if self.track_points:
+            lats = [p["lat"] for p in self.track_points]
+            lons = [p["lon"] for p in self.track_points]
+            center_lat = (min(lats) + max(lats)) / 2
+            center_lon = (min(lons) + max(lons)) / 2
+            self._map_widget.set_position(center_lat, center_lon)
+            # Zoom berechnen
+            lat_range = max(lats) - min(lats)
+            lon_range = max(lons) - min(lons)
+            span = max(lat_range, lon_range)
+            if span > 5:
+                zoom = 6
+            elif span > 2:
+                zoom = 7
+            elif span > 1:
+                zoom = 8
+            elif span > 0.5:
+                zoom = 9
+            elif span > 0.2:
+                zoom = 10
+            elif span > 0.1:
+                zoom = 11
+            else:
+                zoom = 12
+            self._map_widget.set_zoom(zoom)
+
+        # Filter-Liste aufbauen
+        self._build_poi_filter_list(poi_wpts)
+
+        n_poi = len(poi_wpts)
+        self._map_status.configure(text=f"{n_poi} POIs auf der Karte")
+        self._update_filter_count()
+
+    def _clear_map(self):
+        """Entfernt alle Marker und den Pfad von der Karte."""
+        for marker, _ in self._map_markers:
+            marker.delete()
+        self._map_markers.clear()
+        if self._map_path is not None:
+            self._map_path.delete()
+            self._map_path = None
+
+    def _build_poi_filter_list(self, poi_wpts):
+        """Baut die Checkbox-Liste für POI-Filterung auf."""
+        # Alte Widgets entfernen
+        for w in self._poi_list_frame.winfo_children():
+            w.destroy()
+        self._poi_cb_vars.clear()
+        self._poi_cb_widgets.clear()
+
+        if not poi_wpts:
+            ctk.CTkLabel(self._poi_list_frame, text="Keine POIs gefunden.",
+                         font=("Helvetica", 12), text_color=STRAVA_MUTED
+                         ).pack(pady=30)
+            return
+
+        # Nach Kategorie sortieren (Reihenfolge wie POI_GROUPS)
+        group_order = {}
+        for gi, (_, grp_keys) in enumerate(POI_GROUPS):
+            for k in grp_keys:
+                group_order[k] = gi
+        poi_wpts_sorted = sorted(poi_wpts,
+                                  key=lambda x: (group_order.get(x[1].get("type", ""), 99),
+                                                 x[1].get("name", "")))
+
+        # Nach Kategorie gruppiert
+        current_group = None
+        for idx, wp in poi_wpts_sorted:
+            poi_type = wp.get("type", "unknown")
+            # Gruppenheader
+            group = None
+            for grp_label, grp_keys in POI_GROUPS:
+                if poi_type in grp_keys:
+                    group = grp_label
+                    break
+            if group and group != current_group:
+                current_group = group
+                lbl = ctk.CTkLabel(self._poi_list_frame, text=group,
+                                    font=("Helvetica", 10, "bold"),
+                                    text_color=STRAVA_MUTED)
+                lbl.pack(anchor="w", padx=6, pady=(8, 2))
+
+            emoji, color = POI_MARKER_STYLE.get(poi_type, ("📍", STRAVA_MUTED))
+            type_info = TYPE_INFO.get(poi_type, ("POI", "", ""))
+            name = wp.get("name", type_info[0]) or type_info[0]
+            display = f"{emoji} {name[:35]}"
+
+            enabled_val = True
+            if idx < len(self._poi_enabled):
+                enabled_val = self._poi_enabled[idx]
+            var = tk.BooleanVar(value=enabled_val)
+            cb = ctk.CTkCheckBox(
+                self._poi_list_frame, text=display,
+                variable=var,
+                fg_color=color, hover_color=STRAVA_HOVER,
+                checkmark_color="#FFF",
+                border_color=STRAVA_BORDER,
+                text_color=STRAVA_TEXT,
+                font=("Helvetica", 11),
+                command=lambda i=idx, v=var: self._on_poi_toggle(i, v))
+            cb.pack(anchor="w", padx=4, pady=1)
+            self._poi_cb_vars.append((idx, var))
+            self._poi_cb_widgets.append((idx, cb))
+
+    def _on_poi_toggle(self, wpt_idx, var):
+        """Callback wenn ein POI an/abgewählt wird."""
+        self._poi_enabled[wpt_idx] = var.get()
+        self._refresh_map_markers()
+        self._update_filter_count()
+
+    def _set_all_pois_enabled(self, enabled):
+        """Alle POIs aktivieren oder deaktivieren."""
+        for idx, var in self._poi_cb_vars:
+            var.set(enabled)
+            self._poi_enabled[idx] = enabled
+        self._refresh_map_markers()
+        self._update_filter_count()
+
+    def _toggle_category(self, keys):
+        """Toggle alle POIs einer Kategorie (an→aus oder aus→an)."""
+        relevant = [(idx, var) for idx, var in self._poi_cb_vars
+                    if idx < len(self.found_wpts)
+                    and self.found_wpts[idx].get("type", "") in keys]
+        all_on = all(var.get() for _, var in relevant) if relevant else False
+        new_val = not all_on
+        for idx, var in relevant:
+            var.set(new_val)
+            self._poi_enabled[idx] = new_val
+        self._refresh_map_markers()
+        self._update_filter_count()
+
+    def _refresh_map_markers(self):
+        """Löscht alle Marker und zeichnet nur die aktivierten POIs neu."""
+        for marker, _ in self._map_markers:
+            marker.delete()
+        self._map_markers.clear()
+
+        for i, wp in enumerate(self.found_wpts):
+            if wp["type"].endswith("_warn"):
+                continue
+            if not self._poi_enabled[i]:
+                continue
+            poi_type = wp.get("type", "unknown")
+            emoji, color = POI_MARKER_STYLE.get(poi_type, ("📍", STRAVA_MUTED))
+            type_info = TYPE_INFO.get(poi_type, ("POI", "", ""))
+            label = f"{emoji} {wp['name'][:30]}" if wp.get("name") else f"{emoji} {type_info[0]}"
+            marker = self._map_widget.set_marker(
+                wp["lat"], wp["lon"], text=label,
+                marker_color_circle=color,
+                marker_color_outside=STRAVA_DARK)
+            self._map_markers.append((marker, i))
+
+    def _update_filter_count(self):
+        """Aktualisiert die Anzeige wie viele POIs aktiv sind."""
+        total = len(self._poi_cb_vars)
+        active = sum(1 for _, var in self._poi_cb_vars if var.get())
+        self._filter_count_lbl.configure(text=f"{active} / {total}")
+
+    def _on_map_right_click(self, event):
+        """Rechtsklick auf der Karte: nächstgelegenen POI löschen."""
+        self._close_delete_popup()
+        if not self._map_markers or not self.found_wpts:
+            return "break"
+        try:
+            coords = self._map_widget.convert_canvas_coords_to_decimal_coords(
+                event.x, event.y)
+        except Exception:
+            return "break"
+        if not coords:
+            return "break"
+        lat, lon = coords
+        nearest = None
+        best_d = float("inf")
+        for _, idx in self._map_markers:
+            if idx >= len(self.found_wpts):
+                continue
+            wp = self.found_wpts[idx]
+            d = haversine(lat, lon, wp["lat"], wp["lon"])
+            if d < best_d:
+                best_d = d
+                nearest = idx
+        if nearest is None or best_d > self._map_right_click_tol_m:
+            return "break"
+        self._show_delete_popup(event, nearest)
+        return "break"
+
+    def _on_map_left_click(self, event):
+        """Linksklick: Lösch-Popup schließen (falls offen)."""
+        if self._delete_popup is not None:
+            self._close_delete_popup()
+
+    def _on_map_motion(self, event):
+        """Hover-Hinweis: Cursor ändern, wenn ein POI unter dem Mauszeiger ist."""
+        if not self._map_markers or not self.found_wpts:
+            if self._hover_poi_idx is not None:
+                self._hover_poi_idx = None
+                try:
+                    self._map_widget.canvas.configure(cursor="")
+                except Exception:
+                    pass
+            return
+        try:
+            coords = self._map_widget.convert_canvas_coords_to_decimal_coords(
+                event.x, event.y)
+        except Exception:
+            return
+        if not coords:
+            return
+        lat, lon = coords
+        nearest = None
+        best_d = float("inf")
+        for _, idx in self._map_markers:
+            if idx >= len(self.found_wpts):
+                continue
+            wp = self.found_wpts[idx]
+            d = haversine(lat, lon, wp["lat"], wp["lon"])
+            if d < best_d:
+                best_d = d
+                nearest = idx
+        if nearest is not None and best_d <= self._map_hover_tol_m:
+            if self._hover_poi_idx != nearest:
+                self._hover_poi_idx = nearest
+                try:
+                    self._map_widget.canvas.configure(cursor="hand2")
+                except Exception:
+                    pass
+        else:
+            if self._hover_poi_idx is not None:
+                self._hover_poi_idx = None
+                try:
+                    self._map_widget.canvas.configure(cursor="")
+                except Exception:
+                    pass
+
+    def _on_map_leave(self, event):
+        if self._hover_poi_idx is not None:
+            self._hover_poi_idx = None
+            try:
+                self._map_widget.canvas.configure(cursor="")
+            except Exception:
+                pass
+
+    def _show_delete_popup(self, event, wpt_idx):
+        """Zeigt ein kleines Popup am Klickpunkt mit Löschen-Button."""
+        if wpt_idx < 0 or wpt_idx >= len(self.found_wpts):
+            return
+
+        wp = self.found_wpts[wpt_idx]
+        if wp.get("type", "").endswith("_warn"):
+            return
+
+        name = wp.get("name", "POI")
+
+        self._close_delete_popup()
+        popup = ctk.CTkToplevel(self)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        # Position später nach Widget-Größe zentrieren
+        popup.geometry("+0+0")
+
+        frame = ctk.CTkFrame(popup, fg_color=STRAVA_CARD2, corner_radius=8,
+                             border_width=1, border_color=STRAVA_BORDER)
+        frame.pack(padx=1, pady=1)
+        header = ctk.CTkFrame(frame, fg_color="transparent")
+        header.pack(fill="x", padx=8, pady=(6, 0))
+        ctk.CTkLabel(header, text=name[:30],
+                     font=("Helvetica", 11, "bold"),
+                     text_color=STRAVA_TEXT).pack(side="left", padx=(2, 6))
+        ctk.CTkButton(header, text="X", width=22, height=22,
+                      fg_color=STRAVA_CARD, hover_color=STRAVA_BORDER,
+                      text_color=STRAVA_TEXT, font=("Helvetica", 10, "bold"),
+                      command=self._close_delete_popup
+                      ).pack(side="right")
+        ctk.CTkButton(frame, text="Löschen", width=90, height=28,
+                      fg_color="#E74C3C", hover_color="#C0392B",
+                      text_color="#FFF", font=("Helvetica", 11, "bold"),
+                      command=lambda: self._confirm_delete_poi(wpt_idx)
+                      ).pack(padx=10, pady=(6, 8))
+
+        # Popup über dem Marker zentrieren
+        try:
+            cx, cy = self._map_widget.convert_decimal_coords_to_canvas_coords(
+                wp["lat"], wp["lon"])
+            map_x = self._map_widget.winfo_rootx()
+            map_y = self._map_widget.winfo_rooty()
+            popup.update_idletasks()
+            pw = popup.winfo_width()
+            ph = popup.winfo_height()
+            px = int(map_x + cx - pw / 2)
+            py = int(map_y + cy - ph - 8)
+            popup.geometry(f"+{px}+{py}")
+        except Exception:
+            # Fallback: nahe Mauszeiger platzieren
+            x = getattr(event, "x_root", None)
+            y = getattr(event, "y_root", None)
+            if x is None or y is None:
+                x, y = self.winfo_pointerx(), self.winfo_pointery()
+            popup.geometry(f"+{x+8}+{y+8}")
+
+        self._delete_popup = popup
+        self._delete_popup_idx = wpt_idx
+
+    def _close_delete_popup(self):
+        if self._delete_popup is not None:
+            try:
+                self._delete_popup.destroy()
+            except Exception:
+                pass
+        self._delete_popup = None
+        self._delete_popup_idx = None
+
+    def _confirm_delete_poi(self, wpt_idx):
+        self._delete_poi_by_index(wpt_idx)
+        self._close_delete_popup()
+
+    def _delete_poi_by_index(self, wpt_idx):
+        """Löscht einen POI (und passende Warnpunkte) aus der Liste."""
+        if wpt_idx < 0 or wpt_idx >= len(self.found_wpts):
+            return
+        wp = self.found_wpts[wpt_idx]
+        if wp.get("type", "").endswith("_warn"):
+            return
+
+        base_type = wp.get("type", "")
+        base_name = (wp.get("name") or "").strip()
+        warn_type = f"{base_type}_warn"
+
+        to_remove = {wpt_idx}
+        for i, w in enumerate(self.found_wpts):
+            if i == wpt_idx:
+                continue
+            if w.get("type") != warn_type:
+                continue
+            if base_name:
+                hay = " ".join([w.get("name", ""), w.get("cmt", ""), w.get("desc", "")])
+                if base_name in hay:
+                    to_remove.add(i)
+            else:
+                # Fallback: Warnpunkt in der Nähe des POI löschen
+                try:
+                    d = haversine(wp["lat"], wp["lon"], w["lat"], w["lon"])
+                    if d <= max(200, self.warn_var.get() * 2):
+                        to_remove.add(i)
+                except Exception:
+                    pass
+
+        old_enabled = self._poi_enabled[:] if self._poi_enabled else []
+        enabled_by_id = {}
+        for i, w in enumerate(self.found_wpts):
+            val = old_enabled[i] if i < len(old_enabled) else True
+            enabled_by_id[id(w)] = val
+
+        self.found_wpts = [w for i, w in enumerate(self.found_wpts)
+                           if i not in to_remove]
+        self._poi_enabled = [enabled_by_id.get(id(w), True) for w in self.found_wpts]
+
+        poi_wpts = [(i, w) for i, w in enumerate(self.found_wpts)
+                    if not w.get("type", "").endswith("_warn")]
+        self._build_poi_filter_list(poi_wpts)
+        self._refresh_map_markers()
+        self._update_filter_count()
+        self._map_status.configure(text=f"{len(poi_wpts)} POIs auf der Karte")
+
+    def _get_enabled_waypoints(self):
+        """Gibt nur die aktivierten Waypoints zurück (inkl. Warn-Punkte für aktive POIs)."""
+        if not self._poi_enabled or len(self._poi_enabled) != len(self.found_wpts):
+            return self.found_wpts  # Fallback: alle
+
+        enabled = []
+        # Sammle die Typen der aktivierten POIs (für Warn-Punkte)
+        enabled_types = set()
+        for i, wp in enumerate(self.found_wpts):
+            if wp["type"].endswith("_warn"):
+                continue
+            if self._poi_enabled[i]:
+                enabled.append(wp)
+                enabled_types.add(wp["type"])
+
+        # Warn-Punkte: nur für aktivierte POI-Typen UND nahe einem aktivierten POI
+        for i, wp in enumerate(self.found_wpts):
+            if not wp["type"].endswith("_warn"):
+                continue
+            base_type = wp["type"].replace("_warn", "")
+            if base_type in enabled_types and self._poi_enabled[i]:
+                enabled.append(wp)
+
+        return enabled
 
     # ── POI-Suche ────────────────────────────
 
@@ -1457,7 +2272,10 @@ class GPXPOIApp(ctk.CTk):
         radius_m  = self.radius_var.get()
         warn_dist = self.warn_var.get()
 
-        step_m  = adaptive_sample_step(radius_m)
+        if self.sample_mode.get() == "auto":
+            step_m = adaptive_sample_step(radius_m)
+        else:
+            step_m = self.sample_var.get()
         sampled = sample_track(self.track_points, step_m=step_m)
         centers = [(p["lat"], p["lon"]) for p in sampled]
         self._log(f"  Radius: {radius_m} m | Schrittweite: {step_m} m | "
@@ -1507,7 +2325,12 @@ class GPXPOIApp(ctk.CTk):
             p = os.path.join(out, f"{base}_pois.gpx")
             # Vorwarn-Punkte (_warn) nur in FIT – in GPX nur echte POIs
             gpx_wpts = [w for w in wpts if not w["type"].endswith("_warn")]
-            write_gpx_with_waypoints(self.gpx_path.get(), gpx_wpts, p)
+            write_gpx_with_waypoints(
+                self.gpx_path.get(),
+                gpx_wpts,
+                p,
+                overwrite_existing=self.var_overwrite_wpt.get(),
+            )
             self._log(f"  💾 GPX ({len(gpx_wpts)} POIs) → {p}"); saved.append(p)
 
         self.after(0, lambda: self.poi_progress.set(0.94))
@@ -1515,7 +2338,8 @@ class GPXPOIApp(ctk.CTk):
         if self.var_fit.get():
             try:
                 p = os.path.join(out, f"{base}_pois.fit")
-                write_fit_course(self.route_name or base,
+                cname = (self.course_name_var.get().strip() or self.route_name or base)[:16]
+                write_fit_course(cname,
                                  self.track_points, self.cum_dists, wpts, p)
                 self._log(f"  💾 FIT → {p}"); saved.append(p)
             except Exception as e:
@@ -1532,6 +2356,8 @@ class GPXPOIApp(ctk.CTk):
         self.after(0, lambda: self.finish_info.configure(
             text=f"{len(poi_only)} POIs · {len(saved)} Dateien gespeichert"))
         self._log(f"\n✅ Fertig! {len(poi_only)} POIs | {len(saved)} Dateien")
+        # Karte mit Route + POIs befüllen
+        self.after(0, self._populate_map)
 
     # ── Tour-Split ────────────────────────────
 
@@ -1668,39 +2494,33 @@ class GPXPOIApp(ctk.CTk):
         n    = len(indices) - 1
         out  = self.out_dir.get()
         base = os.path.splitext(os.path.basename(self.gpx_path.get()))[0]
+        cname = (self.course_name_var.get().strip() or self.route_name or base)[:16]
         created = []
+        enabled_wpts = self._get_enabled_waypoints()
+
+        # Vorberechnung: nächsten Track-Index für jeden POI (einmalig O(W*N) statt O(E*W*N))
+        wpt_track_idx = []
+        for wp in enabled_wpts:
+            idx, _ = _find_nearest_track_idx(self.track_points, wp["lat"], wp["lon"])
+            wpt_track_idx.append(idx)
 
         for i in range(n):
             si, ei = indices[i], indices[i+1]
             seg_pts, seg_dists = extract_segment(self.track_points, self.cum_dists, si, ei)
-            seg_name = f"{self.route_name or base} – Etappe {i+1}"
+            seg_name = f"{cname} – Etappe {i+1}"
             seg_km   = seg_dists[-1] / 1000
             gain     = compute_elevation_gain(seg_pts)
             self._log(f"  Etappe {i+1}: {seg_km:.1f} km | {gain:.0f} m Hm | "
                       f"Übernacht: {seg_pts[-1]['ele']:.0f} m")
 
-            # POIs dieser Etappe: nur echte POIs (keine _warn), deren nächster Track-Punkt
-            # innerhalb des Etappen-Segments liegt (si ≤ idx ≤ ei)
-            seg_wpts = []
-            for wp in self.found_wpts:
-                if wp["type"].endswith("_warn"):
-                    continue  # Warn-Punkte nicht in Etappen-GPX
-                # nächsten Track-Punkt des POI finden
-                best_d, best_i = float("inf"), 0
-                for j, tp in enumerate(self.track_points):
-                    d = haversine(wp["lat"], wp["lon"], tp["lat"], tp["lon"])
-                    if d < best_d:
-                        best_d, best_i = d, j
-                if si <= best_i <= ei:
-                    seg_wpts.append(wp)
+            # POIs dieser Etappe: nur echte POIs (keine _warn) im Segment
+            seg_wpts = [wp for wp, ti in zip(enabled_wpts, wpt_track_idx)
+                        if not wp["type"].endswith("_warn") and si <= ti <= ei]
 
             if self.var_split_gpx.get():
                 p = os.path.join(out, f"{base}_etappe{i+1:02d}.gpx")
-                # Etappen-GPX: Track + echte POIs als Waypoints (kein _warn)
                 if seg_wpts:
-                    # GPX mit Waypoints: Segment-Track als Basis
                     write_segment_gpx(seg_pts, seg_name, p)
-                    # Waypoints in die GPX einfügen
                     with open(p, "r", encoding="utf-8") as f:
                         seg_content = f.read()
                     wpt_lines = []
@@ -1725,20 +2545,15 @@ class GPXPOIApp(ctk.CTk):
 
             if self.var_split_fit.get():
                 p = os.path.join(out, f"{base}_etappe{i+1:02d}.fit")
-                # Etappen-FIT: echte POIs + etappenspezifische Warn-Punkte
-                seg_wpts_fit = seg_wpts[:]  # echte POIs
-                for wp in self.found_wpts:   # Warn-Punkte dazu
-                    if not wp["type"].endswith("_warn"):
-                        continue
-                    best_d, best_i = float("inf"), 0
-                    for j, tp in enumerate(self.track_points):
-                        d = haversine(wp["lat"], wp["lon"], tp["lat"], tp["lon"])
-                        if d < best_d:
-                            best_d, best_i = d, j
-                    if si <= best_i <= ei:
-                        seg_wpts_fit.append(wp)
+                # Etappen-FIT: echte POIs + Warn-Punkte im Segment
+                seg_wpts_fit = seg_wpts[:]
+                seg_wpts_fit += [wp for wp, ti in zip(enabled_wpts, wpt_track_idx)
+                                 if wp["type"].endswith("_warn") and si <= ti <= ei]
 
-                r = write_segment_fit(seg_pts, seg_dists, seg_name, seg_wpts_fit, p)
+                # FIT Course Name: max 16 Zeichen, z.B. "Mallnitz Bu E01"
+                suffix = f" E{i+1:02d}" if n >= 10 else f" E{i+1}"
+                fit_seg_name = f"{cname[:16-len(suffix)]}{suffix}"
+                r = write_segment_fit(seg_pts, seg_dists, fit_seg_name, seg_wpts_fit, p)
                 if r is True:
                     self._log(f"    FIT → {p}  ({len(seg_wpts)} POIs + Vorwarnpunkte)"); created.append(p)
                 else:
@@ -1769,7 +2584,7 @@ class GPXPOIApp(ctk.CTk):
     def _restart(self):
         self.gpx_path.set("")
         self.track_points = []; self.cum_dists = []
-        self.route_name = ""; self.found_wpts = []
+        self.route_name = ""; self.course_name_var.set(""); self.found_wpts = []
         for lbl, val in [(self.stat_dist,"– km"),(self.stat_elev,"– m ↑"),
                           (self.stat_pts,"–"),(self.stat_name,"–")]:
             lbl.configure(text=val)
@@ -1778,6 +2593,21 @@ class GPXPOIApp(ctk.CTk):
         self.split_status.configure(text="Bereit.", text_color=STRAVA_MUTED)
         self.result_lbl.configure(text="Noch keine Suche durchgeführt.",
                                    text_color=STRAVA_MUTED)
+        # Karte zurücksetzen
+        self._clear_map()
+        self._poi_enabled.clear()
+        self._poi_cb_vars.clear()
+        self._poi_cb_widgets.clear()
+        for w in self._poi_list_frame.winfo_children():
+            w.destroy()
+        self._poi_list_placeholder = ctk.CTkLabel(
+            self._poi_list_frame, text="Zuerst POIs suchen\n(Tab 3)",
+            font=("Helvetica", 12), text_color=STRAVA_MUTED)
+        self._poi_list_placeholder.pack(pady=30)
+        self._map_status.configure(text="Keine POIs geladen")
+        self._filter_count_lbl.configure(text="0 / 0")
+        self._map_widget.set_position(47.5, 13.0)
+        self._map_widget.set_zoom(6)
         self._set_step(0)
 
     # ── Log ───────────────────────────────────
@@ -1788,7 +2618,9 @@ class GPXPOIApp(ctk.CTk):
     def _poll_log(self):
         while not self.log_queue.empty():
             msg = self.log_queue.get()
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+            # Entfernt Zeichen, die die Windows-Konsole (cp1252) nicht kann
+            safe = msg.encode("cp1252", errors="ignore").decode("cp1252")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {safe}")
         self.after(120, self._poll_log)
 
 

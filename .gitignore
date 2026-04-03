@@ -7,3 +7,7 @@ __pycache__/
 *_pois.gpx
 *_etappe*.fit
 *_etappe*.gpx
+
+# Logs and local tool settings
+*.log
+.claude/
